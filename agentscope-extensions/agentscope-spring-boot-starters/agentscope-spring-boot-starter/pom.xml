@@ -44,11 +44,9 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- Core AgentScope library -->
-        <dependency>
-            <groupId>io.agentscope</groupId>
-            <artifactId>agentscope</artifactId>
-        </dependency>
+        <!-- 星辰三期本地基线：去掉 agentscope (all-in-one) 依赖 —— 该 starter 源码并未 import
+             agentscope-all 中的类，且 all 模块要求全部 extensions 已 install（在受限网络下不可行）。
+             去掉后此 starter 仅依赖 agentscope-core (provided)，可独立编译安装。 -->
 
         <!-- Spring Boot auto-configuration SPI -->
         <dependency>
