@@ -497,7 +497,17 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         }
         CallExecution scope = new CallExecution(loaded, loadedEngine, slot);
         if (toolkit != null) {
-            toolkit.setActiveGroups(loaded.getToolContext().getActivatedGroups());
+            // Starlight patch (skill-tool-group activation): only restore the persisted
+            // activated-group set when it is non-empty. A *fresh* session's AgentState has an
+            // empty activatedGroups (freshState() never seeds it from the toolkit), so blindly
+            // calling setActiveGroups([]) here would deactivate EVERY group — including the
+            // build-time-active "skill-build-in-tools" group that hosts load_skill_through_path —
+            // making skills uncallable on the first turn ("Unauthorized tool call: ... not
+            // available"). When empty, keep the toolkit's build-time active groups instead.
+            java.util.List<String> savedGroups = loaded.getToolContext().getActivatedGroups();
+            if (savedGroups != null && !savedGroups.isEmpty()) {
+                toolkit.setActiveGroups(savedGroups);
+            }
         }
         return scope;
     }
