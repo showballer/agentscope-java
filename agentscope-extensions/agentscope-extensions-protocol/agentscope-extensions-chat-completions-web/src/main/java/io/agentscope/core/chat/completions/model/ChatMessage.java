@@ -58,6 +58,15 @@ public class ChatMessage {
 
     private String content;
 
+    /**
+     * Reasoning / thinking delta (assistant role, streaming). Mirrors the {@code reasoning_content}
+     * field emitted by reasoning models (DeepSeek / GLM / DashScope) so the思考 stays visible to
+     * clients and, crucially, keeps the SSE stream alive during the reasoning phase (before any
+     * {@code content} is produced). Clients that don't render thinking can simply ignore it.
+     */
+    @JsonProperty("reasoning_content")
+    private String reasoningContent;
+
     /** Tool calls made by the assistant (only for assistant role). */
     @JsonProperty("tool_calls")
     private List<ToolCall> toolCalls;
@@ -125,6 +134,14 @@ public class ChatMessage {
 
     public void setContent(String content) {
         this.content = content;
+    }
+
+    public String getReasoningContent() {
+        return reasoningContent;
+    }
+
+    public void setReasoningContent(String reasoningContent) {
+        this.reasoningContent = reasoningContent;
     }
 
     public List<ToolCall> getToolCalls() {

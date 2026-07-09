@@ -118,6 +118,31 @@ public class ChatCompletionsChunk {
     }
 
     /**
+     * Create a reasoning (thinking) chunk. Emits the delta as {@code reasoning_content} so reasoning
+     * models keep the SSE stream alive during their thinking phase (before any text content) and
+     * clients may optionally render the thinking. Clients that hide thinking simply ignore this field.
+     *
+     * @param id Request ID
+     * @param model Model name
+     * @param reasoning Reasoning/thinking content delta
+     * @return ChatCompletionsChunk with a reasoning_content delta
+     */
+    public static ChatCompletionsChunk reasoningChunk(String id, String model, String reasoning) {
+        ChatCompletionsChunk chunk = new ChatCompletionsChunk(id, model);
+
+        ChatMessage delta = new ChatMessage();
+        delta.setRole("assistant");
+        delta.setReasoningContent(reasoning);
+
+        ChatChoice choice = new ChatChoice();
+        choice.setIndex(0);
+        choice.setDelta(delta);
+
+        chunk.setChoices(List.of(choice));
+        return chunk;
+    }
+
+    /**
      * Create a tool call chunk.
      *
      * @param id Request ID

@@ -80,12 +80,16 @@ public class ReasoningContext {
         this.messageId = chunk.getId();
 
         // Accumulate ChatUsage
+        // STARLIGHT PATCH: 合并非零而非覆盖。Anthropic 流式把用量拆两帧——message_start 只给 input、
+        // message_delta 只给 output；原来直接覆盖，后到的 message_delta(output-only) 会把 input 清零，
+        // 导致 MiniMax/GLM/Claude 等 Anthropic 族的 token 统计偏小甚至为 0。取各自最新的非零值即可正确合并；
+        // 对「一帧就给全 input+output」的 OpenAI/DashScope 族无影响。配套改见 AnthropicResponseParser.message_start。
         ChatUsage usage = chunk.getUsage();
         if (usage != null) {
-            inputTokens = usage.getInputTokens();
-            outputTokens = usage.getOutputTokens();
-            cachedTokens = usage.getCachedTokens();
-            time = usage.getTime();
+            if (usage.getInputTokens() > 0) inputTokens = usage.getInputTokens();
+            if (usage.getOutputTokens() > 0) outputTokens = usage.getOutputTokens();
+            if (usage.getCachedTokens() > 0) cachedTokens = usage.getCachedTokens();
+            if (usage.getTime() > 0) time = usage.getTime();
         }
 
         List<Msg> streamingMsgs = new ArrayList<>();

@@ -27,6 +27,7 @@ import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.GenerateReason;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ThinkingBlock;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import java.util.ArrayList;
@@ -178,6 +179,26 @@ public class ChatCompletionsStreamingAdapter {
 
         List<ChatCompletionsChunk> chunks = new ArrayList<>();
 
+        // Extract reasoning/thinking content FIRST (order mirrors the model: thinking precedes the
+        // answer). Emitted as a reasoning_content delta so the SSE stream stays alive during the
+        // reasoning phase (before any text) — otherwise a reasoning model produces no downstream
+        // chunk until its answer starts, which reads as a dead/hung stream and can trip
+        // time-to-first-chunk timeouts. Gated by includeText for the same dedup reason as text:
+        // the final accumulated REASONING event repeats the whole thinking.
+        StringBuilder reasoningBuilder = new StringBuilder();
+        for (ContentBlock block : contentBlocks) {
+            if (block instanceof ThinkingBlock) {
+                String thinking = ((ThinkingBlock) block).getThinking();
+                if (thinking != null && !thinking.isEmpty()) {
+                    reasoningBuilder.append(thinking);
+                }
+            }
+        }
+        String reasoningContent = reasoningBuilder.toString();
+        if (!reasoningContent.isEmpty() && includeText) {
+            chunks.add(ChatCompletionsChunk.reasoningChunk(requestId, model, reasoningContent));
+        }
+
         // Extract text content
         StringBuilder textBuilder = new StringBuilder();
         for (ContentBlock block : contentBlocks) {
@@ -249,8 +270,20 @@ public class ChatCompletionsStreamingAdapter {
             }
         }
 
-        // Add finish chunk if this is the last event
-        if (event.isLast()) {
+        // Add finish chunk if this is the last event.
+        //
+        // IMPORTANT: TOOL_RESULT events are flagged isLast=true by StreamingHook on a
+        // *per-phase* basis — each PostActingEvent marks the completion of THAT tool call,
+        // NOT the completion of the whole agent reply. A tool result is never the true end
+        // of an OpenAI-style completion: the ReAct loop always continues with a follow-up
+        // reasoning turn (the final answer) or a summary. Emitting a finish chunk here
+        // produces a spurious mid-stream finish_reason=stop immediately after every tool
+        // result, which streaming clients misread as end-of-response and use to close the
+        // stream before the model's real final answer arrives (especially when the next
+        // reasoning turn is slow). finish_reason semantically belongs to the assistant's
+        // generation turn, so only REASONING (and SUMMARY) events may carry it — a raw
+        // TOOL_RESULT event must not.
+        if (event.isLast() && event.getType() != EventType.TOOL_RESULT) {
             // Determine finish reason based on GenerateReason or tool calls
             // This mirrors the logic in ChatCompletionsResponseBuilder
             String finishReason;
