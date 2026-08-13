@@ -279,11 +279,15 @@ class AnthropicResponseParserTest extends AnthropicFormatterTestBase {
         RawMessageStreamEvent event = mock(RawMessageStreamEvent.class);
         RawMessageStartEvent messageStartEvent = mock(RawMessageStartEvent.class);
         Message message = mock(Message.class);
+        Usage usage = mock(Usage.class);
 
         when(event.isMessageStart()).thenReturn(true);
         when(event.asMessageStart()).thenReturn(messageStartEvent);
         when(messageStartEvent.message()).thenReturn(message);
         when(message.id()).thenReturn("msg_stream_123");
+        when(message.usage()).thenReturn(usage);
+        when(usage.inputTokens()).thenReturn(100L);
+        when(usage.outputTokens()).thenReturn(0L);
 
         Instant startTime = Instant.now();
         Flux<ChatResponse> responseFlux =
@@ -299,11 +303,15 @@ class AnthropicResponseParserTest extends AnthropicFormatterTestBase {
         RawMessageStreamEvent event = mock(RawMessageStreamEvent.class);
         RawMessageStartEvent messageStart = mock(RawMessageStartEvent.class);
         Message message = mock(Message.class);
+        Usage usage = mock(Usage.class);
 
         when(event.isMessageStart()).thenReturn(true);
         when(event.asMessageStart()).thenReturn(messageStart);
         when(messageStart.message()).thenReturn(message);
         when(message.id()).thenReturn("msg_stream_123");
+        when(message.usage()).thenReturn(usage);
+        when(usage.inputTokens()).thenReturn(100L);
+        when(usage.outputTokens()).thenReturn(0L);
 
         when(event.isContentBlockDelta()).thenReturn(false);
         when(event.isContentBlockStart()).thenReturn(false);
@@ -315,6 +323,8 @@ class AnthropicResponseParserTest extends AnthropicFormatterTestBase {
         assertNotNull(response);
         assertEquals("msg_stream_123", response.getId());
         assertTrue(response.getContent().isEmpty()); // MessageStart has no content
+        assertNotNull(response.getUsage());
+        assertEquals(100, response.getUsage().getInputTokens());
     }
 
     @Test

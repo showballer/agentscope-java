@@ -153,6 +153,33 @@ class ReasoningContextTest {
     }
 
     @Test
+    @DisplayName("Should merge usage fields split across streaming chunks")
+    void testSplitChunkUsageAccumulation() {
+        ChatResponse inputChunk =
+                ChatResponse.builder()
+                        .id("msg-1")
+                        .content(List.of(TextBlock.builder().text("Hello").build()))
+                        .usage(ChatUsage.builder().inputTokens(100).cachedTokens(40).build())
+                        .build();
+        ChatResponse outputChunk =
+                ChatResponse.builder()
+                        .id("msg-1")
+                        .content(List.of(TextBlock.builder().text(" world").build()))
+                        .usage(ChatUsage.builder().outputTokens(50).time(1.2).build())
+                        .build();
+
+        context.processChunk(inputChunk);
+        context.processChunk(outputChunk);
+
+        ChatUsage usage = context.getChatUsage();
+        assertNotNull(usage);
+        assertEquals(100, usage.getInputTokens());
+        assertEquals(50, usage.getOutputTokens());
+        assertEquals(40, usage.getCachedTokens());
+        assertEquals(1.2, usage.getTime(), 0.001);
+    }
+
+    @Test
     @DisplayName("Should handle chunks without usage")
     void testChunksWithoutUsage() {
         ChatResponse chunk =

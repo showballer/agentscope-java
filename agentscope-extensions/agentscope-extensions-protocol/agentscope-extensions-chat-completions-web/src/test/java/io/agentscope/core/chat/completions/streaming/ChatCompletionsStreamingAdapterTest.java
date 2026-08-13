@@ -17,6 +17,7 @@ package io.agentscope.core.chat.completions.streaming;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.ReActAgent;
@@ -26,6 +27,7 @@ import io.agentscope.core.chat.completions.model.ChatCompletionsChunk;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ThinkingBlock;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ChatResponse;
@@ -86,6 +88,29 @@ class ChatCompletionsStreamingAdapterTest {
                                         "Hello world",
                                         chunk.getChoices().get(0).getDelta().getContent());
                             })
+                    .verifyComplete();
+        }
+
+        @Test
+        @DisplayName("Should convert thinking event to reasoning content chunk")
+        void shouldConvertThinkingEventToReasoningContentChunk() {
+            Msg msg =
+                    Msg.builder()
+                            .role(MsgRole.ASSISTANT)
+                            .content(ThinkingBlock.builder().thinking("Let me reason").build())
+                            .build();
+
+            Event event = new Event(EventType.REASONING, msg, false);
+
+            StepVerifier.create(adapter.convertEventToChunks(event, "req-123", "reasoner"))
+                    .assertNext(
+                            chunk ->
+                                    assertEquals(
+                                            "Let me reason",
+                                            chunk.getChoices()
+                                                    .get(0)
+                                                    .getDelta()
+                                                    .getReasoningContent()))
                     .verifyComplete();
         }
 
@@ -303,6 +328,27 @@ class ChatCompletionsStreamingAdapterTest {
                                 assertEquals(
                                         "[Tool: get_weather] Sunny, 25°C",
                                         chunk.getChoices().get(0).getDelta().getContent());
+                            })
+                    .verifyComplete();
+        }
+
+        @Test
+        @DisplayName("Should not finish the completion on a last tool result event")
+        void shouldNotFinishCompletionOnLastToolResultEvent() {
+            ToolResultBlock toolResultBlock =
+                    ToolResultBlock.of(
+                            "call-123", "get_weather", TextBlock.builder().text("Sunny").build());
+            Msg msg = Msg.builder().role(MsgRole.ASSISTANT).content(toolResultBlock).build();
+
+            Event event = new Event(EventType.TOOL_RESULT, msg, true);
+
+            StepVerifier.create(adapter.convertEventToChunks(event, "req-123", "gpt-4"))
+                    .assertNext(
+                            chunk -> {
+                                assertEquals(
+                                        "[Tool: get_weather] Sunny",
+                                        chunk.getChoices().get(0).getDelta().getContent());
+                                assertNull(chunk.getChoices().get(0).getFinishReason());
                             })
                     .verifyComplete();
         }
