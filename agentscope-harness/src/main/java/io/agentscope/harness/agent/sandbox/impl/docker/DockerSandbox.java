@@ -70,6 +70,7 @@ public class DockerSandbox extends AbstractBaseSandbox {
     private static final int CONTAINER_START_TIMEOUT_SECONDS = 60;
     private static final int CONTAINER_STOP_TIMEOUT_SECONDS = 30;
     private static final int TAR_TIMEOUT_SECONDS = 120;
+    static final String DOCKER_CLI_PROPERTY = "agentscope.docker.cli";
 
     private final DockerSandboxState dockerState;
 
@@ -107,29 +108,61 @@ public class DockerSandbox extends AbstractBaseSandbox {
                     containerId);
             return;
         }
+        Exception stopFailure = null;
+        Exception removeFailure = null;
         try {
             runDockerCliBlocking(
                     CONTAINER_STOP_TIMEOUT_SECONDS * 2,
-                    "docker",
+                    dockerExecutable(),
                     "stop",
                     "--time=" + CONTAINER_STOP_TIMEOUT_SECONDS,
                     containerId);
             log.debug("[sandbox-docker] Container stopped: {}", containerId);
         } catch (Exception e) {
+            stopFailure = e;
             log.warn(
                     "[sandbox-docker] Failed to stop container {}: {}",
                     containerId,
                     e.getMessage());
         }
         try {
-            runDockerCliBlocking(30, "docker", "rm", "--force", containerId);
+            runDockerCliBlocking(30, dockerExecutable(), "rm", "--force", containerId);
             log.debug("[sandbox-docker] Container removed: {}", containerId);
         } catch (Exception e) {
+            removeFailure = e;
             log.warn(
                     "[sandbox-docker] Failed to remove container {}: {}",
                     containerId,
                     e.getMessage());
         }
+
+        // docker stop/rm can fail transiently. Returning merely because both commands were
+        // attempted is unsafe for bind-mounted workspaces: a surviving background process can
+        // mutate an artifact after the caller has hashed and published it. Only an explicit
+        // stopped state or confirmed absence is a successful shutdown boundary.
+        ContainerState finalState = inspectContainerState(containerId);
+        if (finalState == ContainerState.ABSENT) {
+            dockerState.setContainerId(null);
+            dockerState.setContainerName(null);
+            return;
+        }
+        if (finalState == ContainerState.STOPPED) {
+            log.warn(
+                    "[sandbox-docker] Container {} is stopped but could not be removed; "
+                            + "artifact writes are fenced, cleanup may be retried later",
+                    containerId);
+            return;
+        }
+        SandboxException.SandboxRuntimeException failure =
+                new SandboxException.SandboxRuntimeException(
+                        SandboxErrorCode.WORKSPACE_START_ERROR,
+                        "docker container termination could not be confirmed: "
+                                + containerId
+                                + " state="
+                                + finalState);
+        if (stopFailure != null) failure.addSuppressed(stopFailure);
+        if (removeFailure != null) failure.addSuppressed(removeFailure);
+        throw failure;
     }
 
     @Override
@@ -380,6 +413,10 @@ public class DockerSandbox extends AbstractBaseSandbox {
                 runDockerCliBlocking(
                         CONTAINER_START_TIMEOUT_SECONDS, "docker", "start", containerId);
                 return;
+            } else if (state == ContainerState.UNKNOWN) {
+                throw new SandboxException.SandboxRuntimeException(
+                        SandboxErrorCode.WORKSPACE_START_ERROR,
+                        "docker container state could not be inspected: " + containerId);
             }
             // Container not found — fall through to create a new one
             log.warn("[sandbox-docker] Container {} not found, creating a new one", containerId);
@@ -537,18 +574,21 @@ public class DockerSandbox extends AbstractBaseSandbox {
         try {
             ProcessBuilder pb =
                     new ProcessBuilder(
-                            "docker", "inspect", "-f", "{{.State.Running}}", containerId);
+                            dockerExecutable(), "inspect", "-f", "{{.State.Running}}", containerId);
             Process process = pb.start();
 
             Future<String> stdoutFuture;
+            Future<String> stderrFuture;
             ExecutorService drainer =
-                    Executors.newSingleThreadExecutor(
+                    Executors.newFixedThreadPool(
+                            2,
                             r -> {
                                 Thread t = new Thread(r, "sandbox-docker-inspect");
                                 t.setDaemon(true);
                                 return t;
                             });
             stdoutFuture = drainer.submit(() -> readStream(process.getInputStream(), 1024));
+            stderrFuture = drainer.submit(() -> readStream(process.getErrorStream(), 4096));
             drainer.shutdown();
 
             boolean exited = process.waitFor(10, TimeUnit.SECONDS);
@@ -557,10 +597,24 @@ public class DockerSandbox extends AbstractBaseSandbox {
                 return ContainerState.UNKNOWN;
             }
             if (process.exitValue() != 0) {
+                String stderr = stderrFuture.get().toLowerCase(java.util.Locale.ROOT);
+                if (stderr.contains("no such object") || stderr.contains("no such container")) {
+                    return ContainerState.ABSENT;
+                }
                 return ContainerState.UNKNOWN;
             }
             String output = stdoutFuture.get().trim();
-            return "true".equals(output) ? ContainerState.RUNNING : ContainerState.STOPPED;
+            if ("true".equals(output)) {
+                return ContainerState.RUNNING;
+            }
+            if ("false".equals(output)) {
+                return ContainerState.STOPPED;
+            }
+            log.warn(
+                    "[sandbox-docker] Unexpected inspect state for container {}: '{}'",
+                    containerId,
+                    output);
+            return ContainerState.UNKNOWN;
         } catch (Exception e) {
             log.debug(
                     "[sandbox-docker] Failed to inspect container {}: {}",
@@ -611,6 +665,10 @@ public class DockerSandbox extends AbstractBaseSandbox {
         }
     }
 
+    private static String dockerExecutable() {
+        return System.getProperty(DOCKER_CLI_PROPERTY, "docker");
+    }
+
     /**
      * Reads an InputStream into a String, truncating at {@code maxBytes}.
      */
@@ -637,6 +695,7 @@ public class DockerSandbox extends AbstractBaseSandbox {
     private enum ContainerState {
         RUNNING,
         STOPPED,
+        ABSENT,
         UNKNOWN
     }
 }
