@@ -47,7 +47,8 @@ import org.slf4j.LoggerFactory;
  *   <li>Read {@link SandboxContext} from the current {@link RuntimeContext}</li>
  *   <li>Acquire a session via {@link SandboxManager}</li>
  *   <li>Start the session (4-branch workspace init)</li>
- *   <li>Inject the live session into the {@link SandboxBackedFilesystem} proxy</li>
+ *   <li>Bind the live session on the per-call {@link RuntimeContext} for the
+ *       {@link SandboxBackedFilesystem} proxy to resolve</li>
  * </ol>
  *
  * <h2>doFinally</h2>
@@ -55,7 +56,7 @@ import org.slf4j.LoggerFactory;
  *   <li>Persist sandbox session state via {@link SandboxManager} and
  *       {@link io.agentscope.harness.agent.sandbox.SessionSandboxStateStore}</li>
  *   <li>Release the session via {@link SandboxManager} (stop + optional shutdown)</li>
- *   <li>Clear the session reference from the filesystem proxy</li>
+ *   <li>Clear this call's session binding from the {@link RuntimeContext}</li>
  * </ol>
  *
  * <p>Persistence failures remain diagnostic, but a self-managed sandbox release failure is a

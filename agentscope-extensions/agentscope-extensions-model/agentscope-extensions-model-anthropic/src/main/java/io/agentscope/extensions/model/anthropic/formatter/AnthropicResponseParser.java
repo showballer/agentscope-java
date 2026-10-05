@@ -87,10 +87,14 @@ public class AnthropicResponseParser {
         }
 
         // Parse usage
+        long baseInput = message.usage().inputTokens();
+        long cacheRead = message.usage().cacheReadInputTokens().orElse(0L);
+        long cacheCreate = message.usage().cacheCreationInputTokens().orElse(0L);
         ChatUsage usage =
                 ChatUsage.builder()
-                        .inputTokens((int) message.usage().inputTokens())
+                        .inputTokens((int) (baseInput + cacheRead + cacheCreate))
                         .outputTokens((int) message.usage().outputTokens())
+                        .cachedTokens((int) cacheRead)
                         .time(Duration.between(startTime, Instant.now()).toMillis() / 1000.0)
                         .build();
 
@@ -98,44 +102,73 @@ public class AnthropicResponseParser {
     }
 
     /**
+     * Mutable holder for prompt token counts observed on the message_start event, so the final
+     * usage emitted on message_delta can include input and cached token counts.
+     */
+    private static class StreamUsageState {
+        int inputTokens;
+        int cachedTokens;
+    }
+
+    /**
      * Parse streaming Anthropic events to ChatResponse Flux.
      */
     public static Flux<ChatResponse> parseStreamEvents(
             Flux<RawMessageStreamEvent> eventFlux, Instant startTime) {
-        return eventFlux
-                .flatMap(
-                        event -> {
-                            try {
-                                return Flux.just(parseStreamEvent(event, startTime));
-                            } catch (Exception e) {
-                                log.warn("Error parsing stream event: {}", e.getMessage());
-                                return Flux.empty();
-                            }
-                        })
-                .filter(response -> response != null && !response.getContent().isEmpty());
+        return Flux.defer(
+                () -> {
+                    StreamUsageState usageState = new StreamUsageState();
+                    return eventFlux
+                            .flatMap(
+                                    event -> {
+                                        try {
+                                            return Flux.just(
+                                                    parseStreamEvent(event, startTime, usageState));
+                                        } catch (Exception e) {
+                                            log.warn(
+                                                    "Error parsing stream event: {}",
+                                                    e.getMessage());
+                                            return Flux.empty();
+                                        }
+                                    })
+                            .filter(
+                                    response ->
+                                            response != null
+                                                    && (!response.getContent().isEmpty()
+                                                            || response.getUsage() != null));
+                });
     }
 
     /**
      * Parse single stream event.
      */
-    private static ChatResponse parseStreamEvent(RawMessageStreamEvent event, Instant startTime) {
+    private static ChatResponse parseStreamEvent(
+            RawMessageStreamEvent event, Instant startTime, StreamUsageState usageState) {
         List<ContentBlock> contentBlocks = new ArrayList<>();
         ChatUsage usage = null;
         String messageId = null;
 
-        // Message start
+        // Message start - record prompt usage (input tokens and cache read/creation tokens) so
+        // the final usage emitted on message_delta can include it
         if (event.isMessageStart()) {
             var startMessage = event.asMessageStart().message();
             messageId = startMessage.id();
-            // STARLIGHT PATCH: message_start 携带 input_tokens（提示词用量）。原实现只取 message_delta 的
-            // output_tokens、把这里的 input_tokens 丢了 → 总用量偏小；对 MiniMax/GLM 等 Anthropic 兼容端
-            // （用量主要放在 message_start）更是直接算成 0/NULL。这里补上 input+output。
-            // 配套改：ReasoningContext.processChunk 需「合并非零」而非覆盖，否则后到的 message_delta(output-only)
-            // 会把这里的 input 清零。升级/同步上游 SDK 时核对是否已修，未修则重打此补丁。
+
+            var startUsage = startMessage.usage();
+            long cacheReadTokens = startUsage.cacheReadInputTokens().orElse(0L);
+            long cacheCreationTokens = startUsage.cacheCreationInputTokens().orElse(0L);
+            // Anthropic reports input_tokens excluding cached tokens; add them back so
+            // cachedTokens stays a subset of inputTokens (ChatUsage invariant).
+            usageState.inputTokens =
+                    (int) (startUsage.inputTokens() + cacheReadTokens + cacheCreationTokens);
+            usageState.cachedTokens = (int) cacheReadTokens;
+            // Some compatible providers only report usage at message_start. Emit the
+            // cumulative prompt usage now as well as on the final delta, without adding it twice.
             usage =
                     ChatUsage.builder()
-                            .inputTokens((int) startMessage.usage().inputTokens())
-                            .outputTokens((int) startMessage.usage().outputTokens())
+                            .inputTokens(usageState.inputTokens)
+                            .cachedTokens(usageState.cachedTokens)
+                            .outputTokens((int) startUsage.outputTokens())
                             .time(Duration.between(startTime, Instant.now()).toMillis() / 1000.0)
                             .build();
         }
@@ -198,12 +231,23 @@ public class AnthropicResponseParser {
                             });
         }
 
-        // Message delta - usage information
+        // Message delta - final usage information; combine the cumulative output tokens with
+        // the prompt usage captured on message_start
         if (event.isMessageDelta()) {
-            var messageDelta = event.asMessageDelta();
+            var deltaUsage = event.asMessageDelta().usage();
+            long cacheReadTokens =
+                    deltaUsage.cacheReadInputTokens().orElse((long) usageState.cachedTokens);
+            long inputTokens =
+                    deltaUsage.inputTokens().isPresent()
+                            ? deltaUsage.inputTokens().get()
+                                    + cacheReadTokens
+                                    + deltaUsage.cacheCreationInputTokens().orElse(0L)
+                            : usageState.inputTokens;
             usage =
                     ChatUsage.builder()
-                            .outputTokens((int) messageDelta.usage().outputTokens())
+                            .inputTokens((int) inputTokens)
+                            .cachedTokens((int) cacheReadTokens)
+                            .outputTokens((int) deltaUsage.outputTokens())
                             .time(Duration.between(startTime, Instant.now()).toMillis() / 1000.0)
                             .build();
         }
