@@ -52,8 +52,9 @@ import io.agentscope.harness.agent.IsolationScope;
  * <h2>Lifecycle</h2>
  *
  * <p>The harness calls {@link #tryEnter} before sandbox acquire/resume and closes the returned
- * {@link SandboxLease} after {@link SandboxManager#release} completes, so the guard covers the
- * full call window: {@code acquire → start → (call) → stop → release → lease.close()}.
+ * {@link SandboxLease} only after {@link SandboxManager#release} confirms cleanup, so the guard
+ * covers the full call window: {@code acquire → start → (call) → stop → release → lease.close()}.
+ * A failed release keeps the lease held until an exact-handle cleanup retry succeeds.
  */
 @FunctionalInterface
 public interface SandboxExecutionGuard {

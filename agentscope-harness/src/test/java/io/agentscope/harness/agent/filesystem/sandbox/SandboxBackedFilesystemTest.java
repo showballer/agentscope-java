@@ -17,6 +17,8 @@ package io.agentscope.harness.agent.filesystem.sandbox;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.agent.RuntimeContext;
@@ -25,6 +27,7 @@ import io.agentscope.harness.agent.filesystem.model.FileUploadResponse;
 import io.agentscope.harness.agent.sandbox.ExecResult;
 import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxFileTransfer;
+import io.agentscope.harness.agent.sandbox.SandboxInvocationKey;
 import io.agentscope.harness.agent.sandbox.SandboxState;
 import java.io.InputStream;
 import java.util.HashMap;
@@ -141,6 +144,40 @@ class SandboxBackedFilesystemTest {
 
         assertTrue(!responses.get(0).isSuccess());
         assertEquals("transfer down", responses.get(0).error());
+    }
+
+    @Test
+    void invocationBindingsRouteAndClearOverlappingCallsIndependently() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        RuntimeContext firstContext =
+                RuntimeContext.builder()
+                        .put(SandboxInvocationKey.class, new SandboxInvocationKey(1))
+                        .build();
+        RuntimeContext secondContext =
+                RuntimeContext.builder()
+                        .put(SandboxInvocationKey.class, new SandboxInvocationKey(2))
+                        .build();
+        // AgentScope creates derived RuntimeContexts during execution. They copy typed values but
+        // are not the same context object, so routing must follow the invocation key rather than
+        // RuntimeContext identity.
+        RuntimeContext firstDerivedContext = RuntimeContext.builder(firstContext).build();
+        RuntimeContext secondDerivedContext = RuntimeContext.builder(secondContext).build();
+        FakeSandbox firstSandbox = new FakeSandbox(new ExecResult(0, "first", "", false));
+        FakeSandbox secondSandbox = new FakeSandbox(new ExecResult(0, "second", "", false));
+
+        filesystem.setSandbox(firstContext, firstSandbox);
+        filesystem.setSandbox(secondContext, secondSandbox);
+
+        assertEquals("first", filesystem.execute(firstDerivedContext, "from-first", null).output());
+        assertEquals(
+                "second", filesystem.execute(secondDerivedContext, "from-second", null).output());
+        assertEquals("from-first", firstSandbox.lastCommand);
+        assertEquals("from-second", secondSandbox.lastCommand);
+
+        filesystem.clearSandbox(firstContext, firstSandbox);
+
+        assertNull(filesystem.getSandbox(firstDerivedContext));
+        assertSame(secondSandbox, filesystem.getSandbox(secondDerivedContext));
     }
 
     private static final class FakeTransferSandbox extends BaseFakeSandbox

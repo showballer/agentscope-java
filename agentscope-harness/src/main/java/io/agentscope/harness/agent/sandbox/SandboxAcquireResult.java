@@ -29,8 +29,9 @@ package io.agentscope.harness.agent.sandbox;
  * </ul>
  *
  * <p>When a {@link SandboxExecutionGuard} is configured, the result also carries the
- * {@link SandboxLease} that was acquired before sandbox resume/create. The harness closes it
- * after {@link SandboxManager#release} completes to cover the full call window.
+ * {@link SandboxLease} that was acquired before sandbox resume/create. The harness closes it only
+ * after {@link SandboxManager#release} completes successfully; on a lifecycle failure it retains
+ * both this result and the lease for an exact-handle cleanup retry.
  */
 public final class SandboxAcquireResult {
 
@@ -70,7 +71,8 @@ public final class SandboxAcquireResult {
 
     /**
      * Returns the {@link SandboxLease} held for this call, or a no-op lease if no guard was
-     * configured. The harness closes this lease after {@link SandboxManager#release} completes.
+     * configured. The harness closes this lease only after {@link SandboxManager#release}
+     * completes successfully and retains it while cleanup remains unconfirmed.
      */
     public SandboxLease getLease() {
         return lease;

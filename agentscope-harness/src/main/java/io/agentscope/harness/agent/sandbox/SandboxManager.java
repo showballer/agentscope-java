@@ -31,8 +31,9 @@ import org.slf4j.LoggerFactory;
  * <p>When a {@link SandboxExecutionGuard} is configured, the manager acquires an execution
  * {@link SandboxLease} before sandbox resume/create for isolation keys that are present. The
  * lease is carried by the {@link SandboxAcquireResult} and closed by the caller
- * ({@link io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware}) after {@link #release},
- * ensuring the full call window is covered.
+ * ({@link io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware}) only after {@link
+ * #release} confirms cleanup. A failed release leaves the exact result and lease available for a
+ * retry, ensuring the full call window remains covered.
  *
  * <p>Priority 1 (external sandbox) and Priority 2 (external sandbox state) bypass the guard,
  * since the caller is managing that sandbox externally.
@@ -145,7 +146,7 @@ public class SandboxManager {
         }
     }
 
-    public void release(SandboxAcquireResult result) {
+    public void release(SandboxAcquireResult result) throws Exception {
         if (result == null) {
             return;
         }
@@ -162,9 +163,11 @@ public class SandboxManager {
             return;
         }
 
+        Exception stopFailure = null;
         try {
             sandbox.stop();
         } catch (Exception e) {
+            stopFailure = e;
             log.warn("[sandbox] Sandbox stop failed: {}", e.getMessage(), e);
         }
 
@@ -172,6 +175,13 @@ public class SandboxManager {
             sandbox.shutdown();
         } catch (Exception e) {
             log.warn("[sandbox] Sandbox shutdown failed: {}", e.getMessage(), e);
+            if (stopFailure != null) {
+                e.addSuppressed(stopFailure);
+            }
+            // Lifecycle ownership is not complete until shutdown confirms that the backing
+            // resource is gone. The middleware must retain its lease and retry handle rather
+            // than turning this into a successful release.
+            throw e;
         }
     }
 

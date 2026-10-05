@@ -18,7 +18,9 @@ package io.agentscope.harness.agent.sandbox;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -273,6 +275,17 @@ class SandboxManagerIsolationTest {
         manager.persistState(result, sCtx, rtx);
 
         verify(stateStore, never()).save(any(), any());
+    }
+
+    @Test
+    void releasePropagatesUnconfirmedShutdown() throws Exception {
+        SandboxAcquireResult result = SandboxAcquireResult.selfManaged(freshSandbox);
+        doThrow(new Exception("remove not confirmed")).when(freshSandbox).shutdown();
+
+        assertThrows(Exception.class, () -> manager.release(result));
+
+        verify(freshSandbox).stop();
+        verify(freshSandbox).shutdown();
     }
 
     // ---- clearState ----

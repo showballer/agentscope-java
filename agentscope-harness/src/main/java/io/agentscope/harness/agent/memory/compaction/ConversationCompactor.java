@@ -23,6 +23,7 @@ import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.Model;
+import io.agentscope.core.util.ExceptionUtils;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig.TruncateArgsConfig;
 import io.agentscope.harness.agent.middleware.CompactionMiddleware;
@@ -37,6 +38,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
@@ -85,7 +87,8 @@ public class ConversationCompactor {
      * @param config               compaction configuration
      * @param agentId              agent identifier used for the memory offload path
      * @param sessionId            session identifier used for the memory offload path
-     * @return {@code Optional.empty()} when no compaction was needed; otherwise the replacement
+     * @return {@code Optional.empty()} when no compaction was needed or no usable summary was
+     *         produced (the caller must retain its original messages); otherwise the replacement
      *         message list consisting of {@code [summaryUserMsg] + preservedTail}
      */
     public Mono<Optional<List<Msg>>> compactIfNeeded(
@@ -138,6 +141,11 @@ public class ConversationCompactor {
                                 .doOnSuccess(v -> log.debug("Memory flush before compaction done"))
                                 .onErrorResume(
                                         e -> {
+                                            if (ExceptionUtils.containsInterruptedException(e)
+                                                    || ExceptionUtils.containsCancellationException(
+                                                            e)) {
+                                                return Mono.error(e);
+                                            }
                                             log.warn(
                                                     "Memory flush before compaction failed: {}",
                                                     e.getMessage());
@@ -166,6 +174,11 @@ public class ConversationCompactor {
                                                     path))
                             .onErrorResume(
                                     e -> {
+                                        if (ExceptionUtils.containsInterruptedException(e)
+                                                || ExceptionUtils.containsCancellationException(
+                                                        e)) {
+                                            return Mono.error(e);
+                                        }
                                         log.warn(
                                                 "Message offload before compaction failed: {}",
                                                 e.getMessage());
@@ -200,7 +213,8 @@ public class ConversationCompactor {
                                                             tail.size(),
                                                             compacted.size());
                                                     return Optional.of(compacted);
-                                                }));
+                                                })
+                                        .defaultIfEmpty(Optional.empty()));
     }
 
     // -------------------------------------------------------------------------
@@ -336,7 +350,7 @@ public class ConversationCompactor {
 
     private Mono<String> summarizePrefix(List<Msg> prefix, CompactionConfig config) {
         if (prefix.isEmpty()) {
-            return Mono.just("No previous conversation history.");
+            return Mono.empty();
         }
 
         String formatted = formatMessagesForSummary(prefix);
@@ -349,7 +363,7 @@ public class ConversationCompactor {
                                 .content(TextBlock.builder().text(prompt).build())
                                 .build());
 
-        return model.stream(summarizationInput, null, null)
+        return Flux.defer(() -> model.stream(summarizationInput, null, null))
                 .reduce(
                         new StringBuilder(),
                         (sb, resp) -> {
@@ -365,11 +379,22 @@ public class ConversationCompactor {
                 .map(StringBuilder::toString)
                 .map(String::strip)
                 .filter(s -> !s.isBlank())
-                .defaultIfEmpty("(Summary unavailable)")
+                .switchIfEmpty(
+                        Mono.defer(
+                                () -> {
+                                    log.warn(
+                                            "Summarization returned no text; retaining original"
+                                                    + " context");
+                                    return Mono.empty();
+                                }))
                 .onErrorResume(
                         e -> {
+                            if (ExceptionUtils.containsInterruptedException(e)
+                                    || ExceptionUtils.containsCancellationException(e)) {
+                                return Mono.error(e);
+                            }
                             log.warn("Summarization LLM call failed: {}", e.getMessage());
-                            return Mono.just("(Summarization failed: " + e.getMessage() + ")");
+                            return Mono.empty();
                         });
     }
 

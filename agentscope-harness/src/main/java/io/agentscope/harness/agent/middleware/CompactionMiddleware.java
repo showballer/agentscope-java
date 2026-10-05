@@ -24,6 +24,7 @@ import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.middleware.ReasoningInput;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.state.AgentState;
+import io.agentscope.core.util.ExceptionUtils;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
@@ -34,6 +35,7 @@ import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Middleware that performs conversation compaction before each LLM reasoning call.
@@ -80,66 +82,76 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
         }
         final RuntimeContext rc = ctx != null ? ctx : RuntimeContext.empty();
 
-        return Flux.defer(
-                () -> {
-                    List<Msg> messages = input.messages();
-                    Msg systemMsg = null;
-                    List<Msg> conversation;
-                    if (messages != null
-                            && !messages.isEmpty()
-                            && messages.get(0).getRole() == MsgRole.SYSTEM) {
-                        systemMsg = messages.get(0);
-                        conversation = new ArrayList<>(messages.subList(1, messages.size()));
-                    } else {
-                        conversation = messages != null ? new ArrayList<>(messages) : List.of();
-                    }
+        return Mono.defer(
+                        () -> {
+                            List<Msg> messages = input.messages();
+                            Msg systemMsg = null;
+                            List<Msg> conversation;
+                            if (messages != null
+                                    && !messages.isEmpty()
+                                    && messages.get(0).getRole() == MsgRole.SYSTEM) {
+                                systemMsg = messages.get(0);
+                                conversation =
+                                        new ArrayList<>(messages.subList(1, messages.size()));
+                            } else {
+                                conversation =
+                                        messages != null ? new ArrayList<>(messages) : List.of();
+                            }
 
-                    String agentId = agent.getName();
-                    String sessionId =
-                            rc != null && rc.getSessionId() != null ? rc.getSessionId() : "default";
+                            String agentId = agent.getName();
+                            String sessionId =
+                                    rc != null && rc.getSessionId() != null
+                                            ? rc.getSessionId()
+                                            : "default";
 
-                    CompactionConfig effectiveConfig = resolveEffectiveConfig();
+                            CompactionConfig effectiveConfig = resolveEffectiveConfig();
 
-                    MemoryFlushManager flushManager =
-                            new MemoryFlushManager(workspaceManager, model);
-                    ConversationCompactor compactor =
-                            new ConversationCompactor(model, flushManager);
-                    final Msg sys = systemMsg;
+                            MemoryFlushManager flushManager =
+                                    new MemoryFlushManager(workspaceManager, model);
+                            ConversationCompactor compactor =
+                                    new ConversationCompactor(model, flushManager);
+                            final Msg sys = systemMsg;
 
-                    return compactor
-                            .compactIfNeeded(rc, conversation, effectiveConfig, agentId, sessionId)
-                            .flatMapMany(
-                                    optResult -> {
-                                        if (optResult.isEmpty()) {
-                                            return next.apply(input);
-                                        }
-                                        List<Msg> compacted = optResult.get();
-                                        applyToContext(
-                                                RuntimeContext.resolveAgentState(rc, reActAgent),
-                                                compacted);
-                                        log.debug(
-                                                "Compacted to {} messages before reasoning",
-                                                compacted.size());
-                                        List<Msg> newMessages = new ArrayList<>();
-                                        if (sys != null) {
-                                            newMessages.add(sys);
-                                        }
-                                        newMessages.addAll(compacted);
-                                        return next.apply(
-                                                new ReasoningInput(
+                            return compactor
+                                    .compactIfNeeded(
+                                            rc, conversation, effectiveConfig, agentId, sessionId)
+                                    .map(
+                                            optResult -> {
+                                                if (optResult.isEmpty()) {
+                                                    return input;
+                                                }
+                                                List<Msg> compacted = optResult.get();
+                                                applyToContext(
+                                                        RuntimeContext.resolveAgentState(
+                                                                rc, reActAgent),
+                                                        compacted);
+                                                log.debug(
+                                                        "Compacted to {} messages before reasoning",
+                                                        compacted.size());
+                                                List<Msg> newMessages = new ArrayList<>();
+                                                if (sys != null) {
+                                                    newMessages.add(sys);
+                                                }
+                                                newMessages.addAll(compacted);
+                                                return new ReasoningInput(
                                                         newMessages,
                                                         input.tools(),
-                                                        input.options()));
-                                    })
-                            .onErrorResume(
-                                    e -> {
-                                        log.warn(
-                                                "Compaction failed, continuing without compaction:"
-                                                        + " {}",
-                                                e.getMessage());
-                                        return next.apply(input);
-                                    });
-                });
+                                                        input.options());
+                                            });
+                        })
+                .onErrorResume(
+                        e -> {
+                            if (ExceptionUtils.containsInterruptedException(e)
+                                    || ExceptionUtils.containsCancellationException(e)) {
+                                return Mono.error(e);
+                            }
+                            log.warn(
+                                    "Compaction failed, continuing without compaction: {}",
+                                    e.getMessage());
+                            return Mono.just(input);
+                        })
+                // A downstream reasoning failure must propagate, never retry the model call.
+                .flatMapMany(next);
     }
 
     /**

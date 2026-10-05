@@ -19,8 +19,9 @@ package io.agentscope.harness.agent.sandbox;
  * A handle that represents a held execution right on a sandbox isolation slot.
  *
  * <p>Returned by {@link SandboxExecutionGuard#tryEnter}. The harness closes the lease
- * automatically after {@link SandboxManager#release} completes (whether the call succeeded or
- * failed), so implementations do not need to worry about cleanup ordering.
+ * automatically only after {@link SandboxManager#release} confirms cleanup. If release fails, the
+ * lease remains held together with the exact acquire result so a later retry cannot overlap a new
+ * sandbox execution.
  *
  * <p>Implementations must be idempotent: calling {@link #close()} more than once must be safe.
  */

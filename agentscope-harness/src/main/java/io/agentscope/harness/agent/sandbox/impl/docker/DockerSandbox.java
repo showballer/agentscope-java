@@ -71,6 +71,8 @@ public class DockerSandbox extends AbstractBaseSandbox {
     private static final int CONTAINER_STOP_TIMEOUT_SECONDS = 30;
     private static final int TAR_TIMEOUT_SECONDS = 120;
     static final String DOCKER_CLI_PROPERTY = "agentscope.docker.cli";
+    static final String DOCKER_START_TIMEOUT_SECONDS_PROPERTY =
+            "agentscope.docker.start-timeout-seconds";
 
     private final DockerSandboxState dockerState;
 
@@ -98,16 +100,39 @@ public class DockerSandbox extends AbstractBaseSandbox {
      */
     @Override
     public void shutdown() throws Exception {
-        String containerId = dockerState.getContainerId();
-        if (containerId == null || containerId.isBlank()) {
-            return;
-        }
         if (!dockerState.isContainerOwned()) {
             log.debug(
-                    "[sandbox-docker] Skipping shutdown: container is user-managed: {}",
-                    containerId);
+                    "[sandbox-docker] Skipping shutdown: container is user-managed: id={}, name={}",
+                    dockerState.getContainerId(),
+                    dockerState.getContainerName());
             return;
         }
+        String containerRef = ownedContainerReference();
+        if (containerRef == null) return;
+
+        terminateOwnedContainer(containerRef);
+    }
+
+    /**
+     * Returns the strongest deterministic handle known for a self-managed container.
+     *
+     * <p>{@code docker run -d} can create the container before its CLI process returns the ID. In
+     * that startup window the persisted name is the only ownership handle, and shutdown must not
+     * silently return merely because {@code containerId} has not been populated yet.</p>
+     */
+    private String ownedContainerReference() {
+        String containerId = dockerState.getContainerId();
+        if (containerId != null && !containerId.isBlank()) return containerId;
+        String containerName = dockerState.getContainerName();
+        return containerName == null || containerName.isBlank() ? null : containerName;
+    }
+
+    /**
+     * Stops, force-removes and then inspects one container owned by this sandbox.
+     *
+     * @param containerRef container ID or the deterministic SDK-owned name
+     */
+    private void terminateOwnedContainer(String containerRef) throws Exception {
         Exception stopFailure = null;
         Exception removeFailure = null;
         try {
@@ -116,48 +141,42 @@ public class DockerSandbox extends AbstractBaseSandbox {
                     dockerExecutable(),
                     "stop",
                     "--time=" + CONTAINER_STOP_TIMEOUT_SECONDS,
-                    containerId);
-            log.debug("[sandbox-docker] Container stopped: {}", containerId);
+                    containerRef);
+            log.debug("[sandbox-docker] Container stopped: {}", containerRef);
         } catch (Exception e) {
             stopFailure = e;
             log.warn(
                     "[sandbox-docker] Failed to stop container {}: {}",
-                    containerId,
+                    containerRef,
                     e.getMessage());
         }
         try {
-            runDockerCliBlocking(30, dockerExecutable(), "rm", "--force", containerId);
-            log.debug("[sandbox-docker] Container removed: {}", containerId);
+            runDockerCliBlocking(30, dockerExecutable(), "rm", "--force", containerRef);
+            log.debug("[sandbox-docker] Container removed: {}", containerRef);
         } catch (Exception e) {
             removeFailure = e;
             log.warn(
                     "[sandbox-docker] Failed to remove container {}: {}",
-                    containerId,
+                    containerRef,
                     e.getMessage());
         }
 
         // docker stop/rm can fail transiently. Returning merely because both commands were
         // attempted is unsafe for bind-mounted workspaces: a surviving background process can
-        // mutate an artifact after the caller has hashed and published it. Only an explicit
-        // stopped state or confirmed absence is a successful shutdown boundary.
-        ContainerState finalState = inspectContainerState(containerId);
+        // mutate an artifact after the caller has hashed and published it. A stopped-but-present
+        // container is also not a completed lifecycle: callers would release their permit and
+        // lose the only retry handle. Only confirmed absence is a successful shutdown boundary.
+        ContainerState finalState = inspectContainerState(containerRef);
         if (finalState == ContainerState.ABSENT) {
             dockerState.setContainerId(null);
             dockerState.setContainerName(null);
-            return;
-        }
-        if (finalState == ContainerState.STOPPED) {
-            log.warn(
-                    "[sandbox-docker] Container {} is stopped but could not be removed; "
-                            + "artifact writes are fenced, cleanup may be retried later",
-                    containerId);
             return;
         }
         SandboxException.SandboxRuntimeException failure =
                 new SandboxException.SandboxRuntimeException(
                         SandboxErrorCode.WORKSPACE_START_ERROR,
                         "docker container termination could not be confirmed: "
-                                + containerId
+                                + containerRef
                                 + " state="
                                 + finalState);
         if (stopFailure != null) failure.addSuppressed(stopFailure);
@@ -437,64 +456,85 @@ public class DockerSandbox extends AbstractBaseSandbox {
                 dockerState.getImage(),
                 containerName);
 
-        ProcessBuilder pb = new ProcessBuilder(cmd);
-        Process process = pb.start();
+        Process process = null;
+        ExecutorService drainer = null;
+        try {
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            Process startedProcess = pb.start();
+            process = startedProcess;
 
-        ExecutorService drainer =
-                Executors.newFixedThreadPool(
-                        2,
-                        r -> {
-                            Thread t =
-                                    new Thread(
-                                            r,
-                                            "sandbox-docker-create-" + dockerState.getSessionId());
-                            t.setDaemon(true);
-                            return t;
-                        });
+            drainer =
+                    Executors.newFixedThreadPool(
+                            2,
+                            r -> {
+                                Thread t =
+                                        new Thread(
+                                                r,
+                                                "sandbox-docker-create-"
+                                                        + dockerState.getSessionId());
+                                t.setDaemon(true);
+                                return t;
+                            });
 
-        Future<String> stdoutFuture =
-                drainer.submit(() -> readStream(process.getInputStream(), 64 * 1024));
-        Future<String> stderrFuture =
-                drainer.submit(() -> readStream(process.getErrorStream(), 64 * 1024));
-        drainer.shutdown();
+            Future<String> stdoutFuture =
+                    drainer.submit(() -> readStream(startedProcess.getInputStream(), 64 * 1024));
+            Future<String> stderrFuture =
+                    drainer.submit(() -> readStream(startedProcess.getErrorStream(), 64 * 1024));
+            drainer.shutdown();
 
-        boolean exited = process.waitFor(CONTAINER_START_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        if (!exited) {
-            process.destroyForcibly();
-            drainer.shutdownNow();
-            throw new SandboxException.SandboxRuntimeException(
-                    SandboxErrorCode.WORKSPACE_START_ERROR,
-                    "docker run timed out for image: " + dockerState.getImage());
+            int timeoutSeconds = containerStartTimeoutSeconds();
+            boolean exited = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+            if (!exited) {
+                process.destroyForcibly();
+                drainer.shutdownNow();
+                throw new SandboxException.SandboxRuntimeException(
+                        SandboxErrorCode.WORKSPACE_START_ERROR,
+                        "docker run timed out for image: " + dockerState.getImage());
+            }
+
+            int exitCode = process.exitValue();
+            String stdout = stdoutFuture.get().trim();
+            String stderr = stderrFuture.get().trim();
+
+            if (exitCode != 0) {
+                throw new SandboxException.SandboxRuntimeException(
+                        SandboxErrorCode.WORKSPACE_START_ERROR,
+                        "docker run failed (exit=" + exitCode + "): " + stderr);
+            }
+
+            // stdout is the new container ID
+            String newContainerId = stdout.isBlank() ? null : stdout;
+            if (newContainerId == null) {
+                throw new SandboxException.SandboxRuntimeException(
+                        SandboxErrorCode.WORKSPACE_START_ERROR,
+                        "docker run produced no container ID. stderr: " + stderr);
+            }
+
+            dockerState.setContainerId(newContainerId);
+            log.info(
+                    "[sandbox-docker] Container started: id={}, name={}",
+                    newContainerId,
+                    containerName);
+        } catch (Exception startFailure) {
+            if (process != null && process.isAlive()) {
+                process.destroyForcibly();
+            }
+            if (drainer != null) drainer.shutdownNow();
+            // docker run may have reached the daemon before its CLI timed out, failed, or lost
+            // stdout. The deterministic name is therefore the authoritative fallback ownership
+            // handle. Do not leave a container alive just because its ID was never observed.
+            try {
+                terminateOwnedContainer(containerName);
+            } catch (Exception cleanupFailure) {
+                startFailure.addSuppressed(cleanupFailure);
+            }
+            throw startFailure;
         }
-
-        int exitCode = process.exitValue();
-        String stdout = stdoutFuture.get().trim();
-        String stderr = stderrFuture.get().trim();
-
-        if (exitCode != 0) {
-            throw new SandboxException.SandboxRuntimeException(
-                    SandboxErrorCode.WORKSPACE_START_ERROR,
-                    "docker run failed (exit=" + exitCode + "): " + stderr);
-        }
-
-        // stdout is the new container ID
-        String newContainerId = stdout.isBlank() ? null : stdout;
-        if (newContainerId == null) {
-            throw new SandboxException.SandboxRuntimeException(
-                    SandboxErrorCode.WORKSPACE_START_ERROR,
-                    "docker run produced no container ID. stderr: " + stderr);
-        }
-
-        dockerState.setContainerId(newContainerId);
-        log.info(
-                "[sandbox-docker] Container started: id={}, name={}",
-                newContainerId,
-                containerName);
     }
 
     private List<String> buildDockerRunCommand(String containerName) {
         List<String> cmd = new ArrayList<>();
-        cmd.add("docker");
+        cmd.add(dockerExecutable());
         cmd.add("run");
         cmd.add("-d");
         cmd.add("--name");
@@ -667,6 +707,17 @@ public class DockerSandbox extends AbstractBaseSandbox {
 
     private static String dockerExecutable() {
         return System.getProperty(DOCKER_CLI_PROPERTY, "docker");
+    }
+
+    private static int containerStartTimeoutSeconds() {
+        String configured = System.getProperty(DOCKER_START_TIMEOUT_SECONDS_PROPERTY);
+        if (configured == null || configured.isBlank()) return CONTAINER_START_TIMEOUT_SECONDS;
+        try {
+            int seconds = Integer.parseInt(configured);
+            return seconds > 0 ? seconds : CONTAINER_START_TIMEOUT_SECONDS;
+        } catch (NumberFormatException ignored) {
+            return CONTAINER_START_TIMEOUT_SECONDS;
+        }
     }
 
     /**

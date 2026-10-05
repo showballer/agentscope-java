@@ -17,9 +17,13 @@ package io.agentscope.harness.agent.memory.compaction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -27,6 +31,9 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ThinkingBlock;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
@@ -34,8 +41,13 @@ import io.agentscope.core.model.ToolSchema;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -143,6 +155,269 @@ class ConversationCompactorTest {
         assertTrue(fixture.flushInputs.isEmpty());
     }
 
+    @ParameterizedTest
+    @MethodSource("unusableSummaries")
+    void compactIfNeeded_unusableSummaryDoesNotReplaceOriginalMessages(
+            Flux<ChatResponse> response) {
+        Fixture fixture = new Fixture(false);
+        fixture.model.response = response;
+        List<Msg> original =
+                new ArrayList<>(
+                        List.of(summary("PRIOR_SUMMARY"), message("TAIL_1"), message("TAIL_2")));
+        List<Msg> before = List.copyOf(original);
+
+        assertTrue(fixture.compactOptional(original).isEmpty());
+
+        assertEquals(before, original);
+        assertSame(before.get(0), original.get(0));
+        assertEquals(1, fixture.model.inputs.size());
+    }
+
+    private static Stream<Flux<ChatResponse>> unusableSummaries() {
+        return Stream.of(
+                Flux.empty(),
+                Flux.just(response(" \n\t ")),
+                Flux.just(ChatResponse.builder().content(List.of()).build()),
+                Flux.just(
+                        ChatResponse.builder()
+                                .content(
+                                        List.of(
+                                                ThinkingBlock.builder()
+                                                        .thinking("thinking only")
+                                                        .build()))
+                                .build()),
+                Flux.error(new IllegalStateException("summary unavailable")),
+                Flux.concat(
+                        Flux.just(response("partial summary")),
+                        Flux.error(new IllegalStateException("summary stream interrupted"))));
+    }
+
+    @Test
+    void compactIfNeeded_synchronousModelFailureDoesNotReplaceOriginalMessages() {
+        Fixture fixture = new Fixture(false);
+        fixture.model.synchronousFailure = new IllegalStateException("cannot start summary stream");
+
+        assertTrue(
+                fixture.compactOptional(
+                                List.of(message("OLD"), message("TAIL_1"), message("TAIL_2")))
+                        .isEmpty());
+        assertEquals(1, fixture.model.inputs.size());
+    }
+
+    @Test
+    void compactIfNeeded_failedSummaryDoesNotApplyPreparedToolPruningOrArgTruncation() {
+        Fixture fixture = new Fixture(false);
+        fixture.model.response = Flux.error(new IllegalStateException("summary failed"));
+        String argument = "ARGUMENT".repeat(200);
+        String output = "TOOL_OUTPUT".repeat(200);
+        Msg call = toolCall(argument);
+        Msg result = toolResult(output);
+        List<Msg> original =
+                new ArrayList<>(List.of(call, result, message("TAIL_1"), message("TAIL_2")));
+        List<Msg> before = List.copyOf(original);
+        CompactionConfig aggressiveConfig =
+                CompactionConfig.builder()
+                        .triggerMessages(3)
+                        .triggerTokens(0)
+                        .keepMessages(2)
+                        .keepTokens(0)
+                        .flushBeforeCompact(false)
+                        .offloadBeforeCompact(false)
+                        .truncateArgs(
+                                CompactionConfig.TruncateArgsConfig.builder()
+                                        .triggerMessages(1)
+                                        .keepMessages(2)
+                                        .keepTokens(0)
+                                        .maxArgLength(20)
+                                        .build())
+                        .prune(
+                                CompactionConfig.PruneConfig.builder()
+                                        .protectTokens(0)
+                                        .minimumTokens(1)
+                                        .maxOutputChars(40)
+                                        .build())
+                        .build();
+
+        List<Msg> prepared =
+                fixture.compactor.pruneToolResults(
+                        fixture.compactor.truncateArgs(
+                                original, aggressiveConfig.getTruncateArgsConfig()),
+                        aggressiveConfig.getPruneConfig());
+        assertFalse(
+                argument.equals(
+                        ((ToolUseBlock) prepared.get(0).getContent().get(0))
+                                .getInput()
+                                .get("command")));
+        assertFalse(output.equals(toolOutput(prepared.get(1))));
+
+        assertTrue(
+                fixture.compactor
+                        .compactIfNeeded(
+                                fixture.runtimeContext,
+                                original,
+                                aggressiveConfig,
+                                "agent",
+                                "session")
+                        .block()
+                        .isEmpty());
+
+        assertEquals(before, original);
+        assertSame(call, original.get(0));
+        assertSame(result, original.get(1));
+        assertEquals(argument, ((ToolUseBlock) call.getContent().get(0)).getInput().get("command"));
+        assertEquals(output, toolOutput(result));
+    }
+
+    @Test
+    void compactIfNeeded_keepsToolCallAndResultTogetherWhenCutoffFallsOnResult() {
+        Fixture fixture = new Fixture(false);
+        Msg call = toolCall("command");
+        Msg result = toolResult("result");
+        Msg tail = message("TAIL");
+
+        List<Msg> compacted = fixture.compact(List.of(message("OLD"), call, result, tail));
+
+        assertEquals(4, compacted.size());
+        assertSame(call, compacted.get(1));
+        assertSame(result, compacted.get(2));
+        assertSame(tail, compacted.get(3));
+        assertFalse(fixture.model.prompt(0).contains("tool_call"));
+    }
+
+    @Test
+    void compactIfNeeded_propagatesWrappedInterruptionWithoutReplacement() {
+        Fixture fixture = new Fixture(false);
+        IllegalStateException cancelled =
+                new IllegalStateException("cancelled", new InterruptedException("stop"));
+        fixture.model.response = Flux.error(cancelled);
+
+        assertSame(
+                cancelled,
+                assertThrows(
+                        IllegalStateException.class,
+                        () ->
+                                fixture.compactOptional(
+                                        List.of(
+                                                message("OLD"),
+                                                message("TAIL_1"),
+                                                message("TAIL_2")))));
+    }
+
+    @Test
+    void compactIfNeeded_propagatesFlushInterruptionWithoutCallingSummarizer() {
+        Fixture fixture = new Fixture();
+        IllegalStateException cancelled =
+                new IllegalStateException("cancelled", new InterruptedException("stop"));
+        when(fixture.flushManager.flushMemories(any(RuntimeContext.class), anyList()))
+                .thenReturn(Mono.error(cancelled));
+
+        assertSame(
+                cancelled,
+                assertThrows(
+                        IllegalStateException.class,
+                        () ->
+                                fixture.compactOptional(
+                                        List.of(
+                                                message("OLD"),
+                                                message("TAIL_1"),
+                                                message("TAIL_2")))));
+        assertTrue(fixture.model.inputs.isEmpty());
+    }
+
+    @ParameterizedTest
+    @MethodSource("cancellationFailures")
+    void compactIfNeeded_propagatesOffloadCancellationWithoutCallingSummarizer(
+            RuntimeException cancelled) {
+        Fixture fixture = new Fixture(false, true);
+        doThrow(cancelled)
+                .when(fixture.flushManager)
+                .offloadMessages(any(RuntimeContext.class), anyList(), anyString(), anyString());
+
+        assertSame(
+                cancelled,
+                assertThrows(
+                        RuntimeException.class,
+                        () ->
+                                fixture.compactOptional(
+                                        List.of(
+                                                message("OLD"),
+                                                message("TAIL_1"),
+                                                message("TAIL_2")))));
+        assertTrue(fixture.model.inputs.isEmpty());
+    }
+
+    private static Stream<RuntimeException> cancellationFailures() {
+        return Stream.of(
+                new IllegalStateException("cancelled", new InterruptedException("stop")),
+                new CancellationException("stop"));
+    }
+
+    @Test
+    void compactIfNeeded_ordinaryFlushAndOffloadFailuresStillAllowValidSummary() {
+        Fixture fixture = new Fixture(true, true);
+        when(fixture.flushManager.flushMemories(any(RuntimeContext.class), anyList()))
+                .thenReturn(Mono.error(new IllegalStateException("memory flush unavailable")));
+        doThrow(new IllegalStateException("archive unavailable"))
+                .when(fixture.flushManager)
+                .offloadMessages(any(RuntimeContext.class), anyList(), anyString(), anyString());
+
+        List<Msg> compacted =
+                fixture.compact(List.of(message("OLD"), message("TAIL_1"), message("TAIL_2")));
+
+        assertTrue(text(compacted.get(0)).contains("ROUND_1"));
+        assertEquals(List.of("TAIL_1", "TAIL_2"), texts(compacted.subList(1, compacted.size())));
+        assertEquals(1, fixture.model.inputs.size());
+    }
+
+    @Test
+    void compactIfNeeded_successfulOffloadKeepsArchiveReferenceInSummary() {
+        Fixture fixture = new Fixture(false, true);
+        when(fixture.flushManager.resolveOffloadPath(
+                        any(RuntimeContext.class), anyString(), anyString()))
+                .thenReturn("/archive/session.jsonl");
+
+        List<Msg> compacted =
+                fixture.compact(List.of(message("OLD"), message("TAIL_1"), message("TAIL_2")));
+
+        assertTrue(text(compacted.get(0)).contains("/archive/session.jsonl"));
+        assertTrue(text(compacted.get(0)).contains("ROUND_1"));
+    }
+
+    private static ChatResponse response(String text) {
+        return ChatResponse.builder()
+                .content(List.of(TextBlock.builder().text(text).build()))
+                .build();
+    }
+
+    private static Msg toolCall(String argument) {
+        return Msg.builder()
+                .role(MsgRole.ASSISTANT)
+                .content(
+                        ToolUseBlock.builder()
+                                .id("call-1")
+                                .name("execute")
+                                .input(Map.of("command", argument))
+                                .build())
+                .build();
+    }
+
+    private static Msg toolResult(String output) {
+        return Msg.builder()
+                .role(MsgRole.TOOL)
+                .content(
+                        ToolResultBlock.builder()
+                                .id("call-1")
+                                .name("execute")
+                                .output(List.of(TextBlock.builder().text(output).build()))
+                                .build())
+                .build();
+    }
+
+    private static String toolOutput(Msg message) {
+        ToolResultBlock result = (ToolResultBlock) message.getContent().get(0);
+        return ((TextBlock) result.getOutput().get(0)).getText();
+    }
+
     /** Creates a regular user message. */
     private static Msg message(String text) {
         return Msg.builder()
@@ -187,6 +462,10 @@ class ConversationCompactorTest {
 
         /** Creates a fixture with the requested memory-flush setting. */
         private Fixture(boolean flushBeforeCompact) {
+            this(flushBeforeCompact, false);
+        }
+
+        private Fixture(boolean flushBeforeCompact, boolean offloadBeforeCompact) {
             when(flushManager.flushMemories(any(RuntimeContext.class), anyList()))
                     .thenAnswer(
                             invocation -> {
@@ -194,6 +473,9 @@ class ConversationCompactorTest {
                                 flushInputs.add(List.copyOf(input));
                                 return Mono.empty();
                             });
+            when(flushManager.resolveOffloadPath(
+                            any(RuntimeContext.class), anyString(), anyString()))
+                    .thenReturn("");
             compactor = new ConversationCompactor(model, flushManager);
             config =
                     CompactionConfig.builder()
@@ -203,7 +485,7 @@ class ConversationCompactorTest {
                             .keepTokens(0)
                             .summaryPrompt("SUMMARY_INPUT:\n{messages}")
                             .flushBeforeCompact(flushBeforeCompact)
-                            .offloadBeforeCompact(false)
+                            .offloadBeforeCompact(offloadBeforeCompact)
                             .truncateArgs(null)
                             .prune(null)
                             .build();
@@ -211,13 +493,15 @@ class ConversationCompactorTest {
 
         /** Runs compaction and requires the supplied input to trigger it. */
         private List<Msg> compact(List<Msg> messages) {
-            Optional<List<Msg>> result =
-                    compactor
-                            .compactIfNeeded(
-                                    runtimeContext, messages, config, "agent-id", "session-id")
-                            .block();
+            Optional<List<Msg>> result = compactOptional(messages);
             assertTrue(result.isPresent());
             return result.orElseThrow();
+        }
+
+        private Optional<List<Msg>> compactOptional(List<Msg> messages) {
+            return compactor
+                    .compactIfNeeded(runtimeContext, messages, config, "agent-id", "session-id")
+                    .block();
         }
     }
 
@@ -225,12 +509,20 @@ class ConversationCompactorTest {
     private static final class RecordingModel implements Model {
 
         private final List<List<Msg>> inputs = new ArrayList<>();
+        private Flux<ChatResponse> response;
+        private RuntimeException synchronousFailure;
 
         /** Records the model input and emits a fixed text response for the current invocation. */
         @Override
         public Flux<ChatResponse> stream(
                 List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
             inputs.add(List.copyOf(messages));
+            if (synchronousFailure != null) {
+                throw synchronousFailure;
+            }
+            if (response != null) {
+                return response;
+            }
             String summary = "ROUND_" + inputs.size();
             return Flux.just(
                     ChatResponse.builder()

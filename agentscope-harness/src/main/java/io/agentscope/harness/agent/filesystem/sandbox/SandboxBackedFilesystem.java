@@ -24,27 +24,35 @@ import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxAware;
 import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.SandboxFileTransfer;
+import io.agentscope.harness.agent.sandbox.SandboxInvocationKey;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * A {@link BaseSandboxFilesystem} that delegates execution to a live {@link Sandbox}.
  *
- * <p>Stable proxy created at agent build time; a fresh {@link Sandbox} is injected on each call
- * via the volatile {@code sandbox} field by {@link
- * io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware}.
+ * <p>Stable proxy created at agent build time. Harness calls bind a fresh {@link Sandbox} to a
+ * unique per-invocation key carried by {@link RuntimeContext}; this prevents derived contexts from
+ * losing their routing identity. The context-free binding is also used by legacy Harness
+ * components that do not yet propagate a call context. {@code SandboxLifecycleMiddleware}
+ * serializes those call windows, and conditional clearing prevents stale cleanup from removing a
+ * different binding.
  */
 public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements SandboxAware {
 
     private static final Logger log = LoggerFactory.getLogger(SandboxBackedFilesystem.class);
 
     private final String fsId;
-    private volatile Sandbox sandbox;
+    private final AtomicReference<Sandbox> fallbackSandbox = new AtomicReference<>();
+    private final ConcurrentMap<Object, Sandbox> callSandboxes = new ConcurrentHashMap<>();
 
     public SandboxBackedFilesystem() {
         this.fsId = "sandbox-" + UUID.randomUUID().toString().substring(0, 8);
@@ -52,12 +60,60 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
 
     @Override
     public void setSandbox(Sandbox sandbox) {
-        this.sandbox = sandbox;
+        fallbackSandbox.set(sandbox);
     }
 
     @Override
     public Sandbox getSandbox() {
-        return sandbox;
+        return fallbackSandbox.get();
+    }
+
+    /** Clear the context-free binding only when it still refers to the expected sandbox. */
+    public void clearSandbox(Sandbox expectedSandbox) {
+        fallbackSandbox.compareAndSet(expectedSandbox, null);
+    }
+
+    /** Bind a sandbox to one unique invocation context. */
+    public void setSandbox(RuntimeContext runtimeContext, Sandbox sandbox) {
+        if (runtimeContext == null) {
+            setSandbox(sandbox);
+            return;
+        }
+        Object routingKey = routingKey(runtimeContext);
+        if (sandbox == null) {
+            callSandboxes.remove(routingKey);
+        } else {
+            callSandboxes.put(routingKey, sandbox);
+        }
+    }
+
+    /** Resolve the sandbox bound to one invocation, falling back to the legacy binding. */
+    public Sandbox getSandbox(RuntimeContext runtimeContext) {
+        if (runtimeContext != null) {
+            SandboxInvocationKey invocationKey = runtimeContext.get(SandboxInvocationKey.class);
+            if (invocationKey != null) {
+                // A token-bearing context belongs to one exact invocation. Never route a stale
+                // token to the context-free binding of a later serialized call.
+                return callSandboxes.get(invocationKey);
+            }
+            Sandbox directBinding = callSandboxes.get(runtimeContext);
+            if (directBinding != null) {
+                return directBinding;
+            }
+        }
+        return fallbackSandbox.get();
+    }
+
+    /**
+     * Clear only the expected invocation binding. A late cleanup can therefore never remove a
+     * newer binding, even if a caller incorrectly reuses a context instance.
+     */
+    public void clearSandbox(RuntimeContext runtimeContext, Sandbox expectedSandbox) {
+        if (runtimeContext == null) {
+            fallbackSandbox.compareAndSet(expectedSandbox, null);
+            return;
+        }
+        callSandboxes.remove(routingKey(runtimeContext), expectedSandbox);
     }
 
     @Override
@@ -68,7 +124,7 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     @Override
     public ExecuteResponse execute(
             RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
-        Sandbox active = requireSandbox();
+        Sandbox active = requireSandbox(runtimeContext);
         try {
             ExecResult result = active.exec(runtimeContext, command, timeoutSeconds);
             return new ExecuteResponse(
@@ -91,7 +147,7 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     @Override
     public List<FileUploadResponse> uploadFiles(
             RuntimeContext runtimeContext, List<Map.Entry<String, byte[]>> files) {
-        Sandbox active = requireSandbox();
+        Sandbox active = requireSandbox(runtimeContext);
         List<FileUploadResponse> results = new ArrayList<>(files.size());
 
         for (Map.Entry<String, byte[]> file : files) {
@@ -147,7 +203,7 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     @Override
     public List<FileDownloadResponse> downloadFiles(
             RuntimeContext runtimeContext, List<String> paths) {
-        Sandbox active = requireSandbox();
+        Sandbox active = requireSandbox(runtimeContext);
         List<FileDownloadResponse> results = new ArrayList<>(paths.size());
 
         for (String path : paths) {
@@ -192,13 +248,18 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         return results;
     }
 
-    private Sandbox requireSandbox() {
-        Sandbox s = sandbox;
+    private Sandbox requireSandbox(RuntimeContext runtimeContext) {
+        Sandbox s = getSandbox(runtimeContext);
         if (s == null) {
             throw new SandboxException.SandboxConfigurationException(
                     "No active sandbox — sandbox filesystem used outside of a call context");
         }
         return s;
+    }
+
+    private Object routingKey(RuntimeContext runtimeContext) {
+        SandboxInvocationKey invocationKey = runtimeContext.get(SandboxInvocationKey.class);
+        return invocationKey != null ? invocationKey : runtimeContext;
     }
 
     private String shellSingleQuote(String s) {
