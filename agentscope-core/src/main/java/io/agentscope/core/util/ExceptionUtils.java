@@ -15,6 +15,9 @@
  */
 package io.agentscope.core.util;
 
+import java.util.IdentityHashMap;
+import java.util.concurrent.CancellationException;
+
 /**
  * Utility methods for exception handling.
  */
@@ -56,5 +59,38 @@ public final class ExceptionUtils {
 
         // Fall back to the exception class name
         return throwable.getClass().getSimpleName();
+    }
+
+    /**
+     * Whether an interruption is present in the cause chain. Identity tracking prevents cycles
+     * in malformed exception chains from hanging error recovery.
+     *
+     * @param error the throwable to inspect (may be {@code null})
+     * @return whether the throwable or one of its causes is an {@link InterruptedException}
+     */
+    public static boolean containsInterruptedException(Throwable error) {
+        return containsCause(error, InterruptedException.class);
+    }
+
+    /**
+     * Whether an explicit cancellation is present in the cause chain.
+     *
+     * @param error the throwable to inspect (may be {@code null})
+     * @return whether the throwable or one of its causes is a {@link CancellationException}
+     */
+    public static boolean containsCancellationException(Throwable error) {
+        return containsCause(error, CancellationException.class);
+    }
+
+    private static boolean containsCause(Throwable error, Class<? extends Throwable> type) {
+        IdentityHashMap<Throwable, Boolean> visited = new IdentityHashMap<>();
+        Throwable current = error;
+        while (current != null && visited.put(current, Boolean.TRUE) == null) {
+            if (type.isInstance(current)) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 }

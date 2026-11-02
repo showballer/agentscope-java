@@ -20,9 +20,9 @@ import io.agentscope.harness.agent.filesystem.sandbox.SandboxBackedFilesystem;
 /**
  * Marks a filesystem that can have its backing {@link Sandbox} injected at runtime.
  *
- * <p>Implemented by {@link SandboxBackedFilesystem} so {@link
- * io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware} can set the active sandbox for each
- * call and clear it afterward.
+ * <p>Implemented by {@link SandboxBackedFilesystem}. Harness lifecycle wiring uses that
+ * implementation's invocation-context binding so overlapping calls remain isolated; these
+ * context-free methods remain the compatibility surface for direct users.
  */
 public interface SandboxAware {
 

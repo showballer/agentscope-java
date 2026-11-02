@@ -22,6 +22,7 @@ import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.MessageParam;
 import com.anthropic.models.messages.RawMessageStreamEvent;
 import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.model.ChatModelBase;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.GenerateOptions;
@@ -84,6 +85,7 @@ public class AnthropicChatModel extends ChatModelBase {
      * @param formatter      the message formatter to use (null for default
      *                       Anthropic formatter)
      * @param proxyConfig    the proxy configuration (null for no proxy)
+     * @param cacheTtl       the TTL for prompt-caching markers (null for default 5m)
      */
     public AnthropicChatModel(
             String baseUrl,
@@ -92,7 +94,30 @@ public class AnthropicChatModel extends ChatModelBase {
             boolean streamEnabled,
             GenerateOptions defaultOptions,
             AnthropicBaseFormatter formatter,
-            ProxyConfig proxyConfig) {
+            ProxyConfig proxyConfig,
+            String cacheTtl) {
+        this(
+                baseUrl,
+                apiKey,
+                modelName,
+                streamEnabled,
+                defaultOptions,
+                formatter,
+                proxyConfig,
+                cacheTtl,
+                null);
+    }
+
+    private AnthropicChatModel(
+            String baseUrl,
+            String apiKey,
+            String modelName,
+            boolean streamEnabled,
+            GenerateOptions defaultOptions,
+            AnthropicBaseFormatter formatter,
+            ProxyConfig proxyConfig,
+            String cacheTtl,
+            AnthropicClient client) {
         this.baseUrl = baseUrl;
         this.apiKey = apiKey;
         this.modelName = modelName;
@@ -100,6 +125,12 @@ public class AnthropicChatModel extends ChatModelBase {
         this.defaultOptions =
                 defaultOptions != null ? defaultOptions : GenerateOptions.builder().build();
         this.formatter = formatter != null ? formatter : new AnthropicChatFormatter();
+        this.formatter.cacheTtl(cacheTtl);
+
+        if (client != null) {
+            this.client = client;
+            return;
+        }
 
         // Initialize Anthropic client
         AnthropicOkHttpClient.Builder clientBuilder = AnthropicOkHttpClient.builder();
@@ -158,13 +189,41 @@ public class AnthropicChatModel extends ChatModelBase {
                                                 .model(modelName)
                                                 .maxTokens(4096);
 
+                                GenerateOptions effectiveOptions =
+                                        GenerateOptions.mergeOptions(options, defaultOptions);
+                                boolean cacheControlEnabled =
+                                        effectiveOptions != null
+                                                && Boolean.TRUE.equals(
+                                                        effectiveOptions.getCacheControl());
+
                                 // Extract and apply system message
-                                // (Anthropic-specific requirement)
-                                formatter.applySystemMessage(paramsBuilder, messages);
+                                // (Anthropic-specific requirement);
+                                // adds cache_control when prompt caching is enabled
+                                formatter.applySystemMessage(
+                                        paramsBuilder, messages, cacheControlEnabled);
+
+                                // The leading system message has been applied to the `system`
+                                // field above. Exclude it from the message body so the system
+                                // prompt isn't sent twice.
+                                List<Msg> conversationMessages = messages;
+                                if (messages != null
+                                        && !messages.isEmpty()
+                                        && messages.get(0).getRole() == MsgRole.SYSTEM) {
+                                    conversationMessages = messages.subList(1, messages.size());
+                                }
 
                                 // Use formatter to convert Msg to Anthropic
                                 // MessageParam
-                                List<MessageParam> formattedMessages = formatter.format(messages);
+                                List<MessageParam> formattedMessages =
+                                        formatter.format(conversationMessages);
+
+                                // Apply automatic cache control strategy
+                                // (marks the last message to cache the conversation prefix)
+                                if (cacheControlEnabled) {
+                                    formattedMessages =
+                                            formatter.applyCacheControl(formattedMessages);
+                                }
+
                                 for (MessageParam param : formattedMessages) {
                                     paramsBuilder.addMessage(param);
                                 }
@@ -256,6 +315,25 @@ public class AnthropicChatModel extends ChatModelBase {
         private AnthropicBaseFormatter formatter;
         private ProxyConfig proxyConfig;
         private int contextWindowSize = -1;
+        private String cacheTtl;
+
+        private AnthropicClient client;
+
+        /**
+         * Uses an externally configured Anthropic client.
+         *
+         * <p>The client supplies its own URL, credentials, proxy, timeout and retry settings; the
+         * corresponding connection settings on this builder are ignored. The caller owns the client
+         * and must close it after all model calls have finished. Individual streaming responses are
+         * still closed by this model. Passing {@code null} preserves the default client creation.
+         *
+         * @param client the externally managed client, or null to create the default client
+         * @return this builder
+         */
+        public Builder client(AnthropicClient client) {
+            this.client = client;
+            return this;
+        }
 
         /**
          * Sets the base URL for the Anthropic API.
@@ -338,6 +416,17 @@ public class AnthropicChatModel extends ChatModelBase {
             return this;
         }
 
+        /**
+         * Sets the TTL for prompt-caching markers (e.g. {@code "1h"}).
+         *
+         * @param cacheTtl the cache TTL string (null for default 5m ephemeral)
+         * @return this builder
+         */
+        public Builder cacheTtl(String cacheTtl) {
+            this.cacheTtl = cacheTtl;
+            return this;
+        }
+
         public Builder contextWindowSize(int contextWindowSize) {
             this.contextWindowSize = contextWindowSize;
             return this;
@@ -357,7 +446,9 @@ public class AnthropicChatModel extends ChatModelBase {
                             streamEnabled,
                             defaultOptions,
                             formatter,
-                            proxyConfig);
+                            proxyConfig,
+                            cacheTtl,
+                            client);
             model.setContextWindowSize(
                     contextWindowSize >= 0
                             ? contextWindowSize
