@@ -18,9 +18,25 @@ package io.agentscope.extensions.model.anthropic;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.core.http.StreamResponse;
+import com.anthropic.models.messages.Message;
+import com.anthropic.models.messages.MessageCreateParams;
+import com.anthropic.models.messages.MessageParam;
+import com.anthropic.models.messages.RawMessageStreamEvent;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
+import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.ToolChoice;
 import io.agentscope.core.model.ToolSchema;
@@ -29,7 +45,10 @@ import io.agentscope.core.model.transport.ProxyConfig;
 import io.agentscope.extensions.model.anthropic.formatter.AnthropicChatFormatter;
 import io.agentscope.extensions.model.anthropic.formatter.AnthropicMultiAgentFormatter;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -70,6 +89,60 @@ class AnthropicChatModelTest {
 
         assertNotNull(model, "Model should be created");
         assertEquals("claude-sonnet-4-5-20250929", model.getModelName());
+    }
+
+    @Test
+    @DisplayName("Injected client is used for non-streaming without taking lifecycle ownership")
+    void injectedClientHandlesNonStreamingCalls() {
+        AnthropicClient client = mock(AnthropicClient.class, RETURNS_DEEP_STUBS);
+        Message message = mock(Message.class);
+        AnthropicChatFormatter formatter = mock(AnthropicChatFormatter.class);
+        ChatResponse expected = ChatResponse.builder().build();
+        when(formatter.format(any()))
+                .thenReturn(
+                        List.of(
+                                MessageParam.builder()
+                                        .role(MessageParam.Role.USER)
+                                        .content("hello")
+                                        .build()));
+        when(formatter.parseResponse(any(Message.class), any(Instant.class))).thenReturn(expected);
+        when(client.async().messages().create(any(MessageCreateParams.class)))
+                .thenReturn(CompletableFuture.completedFuture(message));
+
+        AnthropicChatModel model =
+                AnthropicChatModel.builder()
+                        .client(client)
+                        .baseUrl("not-a-valid-url")
+                        .formatter(formatter)
+                        .stream(false)
+                        .build();
+
+        assertSame(expected, model.stream(List.of(), null, null).blockLast(Duration.ofSeconds(5)));
+        verify(client.async().messages()).create(any(MessageCreateParams.class));
+        verify(client, never()).close();
+    }
+
+    @Test
+    @DisplayName("Injected streaming client keeps caller ownership while closing its response")
+    @SuppressWarnings("unchecked")
+    void injectedClientClosesStreamingResponseOnly() {
+        AnthropicClient client = mock(AnthropicClient.class, RETURNS_DEEP_STUBS);
+        StreamResponse<RawMessageStreamEvent> response = mock(StreamResponse.class);
+        when(response.stream()).thenReturn(Stream.empty());
+        when(client.messages().createStreaming(any(MessageCreateParams.class))).thenReturn(response);
+        AnthropicChatModel model = AnthropicChatModel.builder().client(client).stream(true).build();
+
+        Msg input =
+                Msg.builder()
+                        .name("user")
+                        .role(MsgRole.USER)
+                        .content(TextBlock.builder().text("hello").build())
+                        .build();
+        model.stream(List.of(input), null, null).collectList().block(Duration.ofSeconds(5));
+
+        verify(client.messages()).createStreaming(any(MessageCreateParams.class));
+        verify(response, timeout(1000)).close();
+        verify(client, never()).close();
     }
 
     @Test

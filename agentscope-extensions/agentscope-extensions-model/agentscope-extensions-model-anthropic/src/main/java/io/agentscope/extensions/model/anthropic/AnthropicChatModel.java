@@ -96,6 +96,28 @@ public class AnthropicChatModel extends ChatModelBase {
             AnthropicBaseFormatter formatter,
             ProxyConfig proxyConfig,
             String cacheTtl) {
+        this(
+                baseUrl,
+                apiKey,
+                modelName,
+                streamEnabled,
+                defaultOptions,
+                formatter,
+                proxyConfig,
+                cacheTtl,
+                null);
+    }
+
+    private AnthropicChatModel(
+            String baseUrl,
+            String apiKey,
+            String modelName,
+            boolean streamEnabled,
+            GenerateOptions defaultOptions,
+            AnthropicBaseFormatter formatter,
+            ProxyConfig proxyConfig,
+            String cacheTtl,
+            AnthropicClient client) {
         this.baseUrl = baseUrl;
         this.apiKey = apiKey;
         this.modelName = modelName;
@@ -104,6 +126,11 @@ public class AnthropicChatModel extends ChatModelBase {
                 defaultOptions != null ? defaultOptions : GenerateOptions.builder().build();
         this.formatter = formatter != null ? formatter : new AnthropicChatFormatter();
         this.formatter.cacheTtl(cacheTtl);
+
+        if (client != null) {
+            this.client = client;
+            return;
+        }
 
         // Initialize Anthropic client
         AnthropicOkHttpClient.Builder clientBuilder = AnthropicOkHttpClient.builder();
@@ -290,6 +317,24 @@ public class AnthropicChatModel extends ChatModelBase {
         private int contextWindowSize = -1;
         private String cacheTtl;
 
+        private AnthropicClient client;
+
+        /**
+         * Uses an externally configured Anthropic client.
+         *
+         * <p>The client supplies its own URL, credentials, proxy, timeout and retry settings; the
+         * corresponding connection settings on this builder are ignored. The caller owns the client
+         * and must close it after all model calls have finished. Individual streaming responses are
+         * still closed by this model. Passing {@code null} preserves the default client creation.
+         *
+         * @param client the externally managed client, or null to create the default client
+         * @return this builder
+         */
+        public Builder client(AnthropicClient client) {
+            this.client = client;
+            return this;
+        }
+
         /**
          * Sets the base URL for the Anthropic API.
          *
@@ -402,7 +447,8 @@ public class AnthropicChatModel extends ChatModelBase {
                             defaultOptions,
                             formatter,
                             proxyConfig,
-                            cacheTtl);
+                            cacheTtl,
+                            client);
             model.setContextWindowSize(
                     contextWindowSize >= 0
                             ? contextWindowSize
